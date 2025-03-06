@@ -1,4 +1,7 @@
-# Kandidat
+
+
+
+
 
 import bluetooth
 

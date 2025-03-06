@@ -1,14 +1,19 @@
 
+hej hej
 
+hej hej
 
-
-
+/code
 import bluetooth
 
 def bluetooth_mirror():
+
     server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+    
     port = bluetooth.PORT_ANY  # Use an available RFCOMM port
+    
     server_sock.bind(("localhost", port))  # Bind to local Bluetooth interface
+    
     server_sock.listen(1)  # Start listening for connections
 
     uuid = "00001101-0000-1000-8000-00805F9B34FB"  # UUID for Serial Port Profile (SPP)

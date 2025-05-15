@@ -40,16 +40,18 @@ def kalman_update(kalman_state, acc, measurement=None, dt=0.1):
     B = np.array([[0.5 * dt**2], [dt]])
     x = np.array([[kalman_state['x']], [kalman_state['v']]])
     u = np.array([[acc]])
-
     Q = np.array([[0.01, 0], [0, 0.01]])
 
     acc_magnitude = abs(acc)
-    if acc_magnitude < 0.1:
-        R = 5.0    # Lita på DWM
-    elif acc_magnitude < 1.0:
-        R = 25.0   # Lita delvis på båda
+    if measurement is not None:
+        if acc_magnitude < 0.1:
+            R = 5.0
+        elif acc_magnitude < 1.0:
+            R = 25.0
+        else:
+            R = 100.0
     else:
-        R = 100.0  # Lita mer på acc
+        R = 50.0
 
     x_pred = A @ x + B @ u
     P_pred = A @ kalman_state['P'] @ A.T + Q
@@ -70,6 +72,11 @@ def kalman_update(kalman_state, acc, measurement=None, dt=0.1):
     kalman_state['v'] = x_new[1, 0]
     kalman_state['P'] = P_new
     return kalman_state['x']
+
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Misslyckades med att ta emot scan descriptor")
 
 def update_position(new_x, new_y):
     global x, y
@@ -97,7 +104,7 @@ def parse_packet(packet):
     return angle, max(0, distance_cm), quality
 
 def lidar_task(client_sock):
-    global lidar_active
+    global lidar_active, x, y
     lidar_active = True
     try:
         with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
@@ -105,11 +112,13 @@ def lidar_task(client_sock):
             time.sleep(0.1)
             ser.reset_input_buffer()
             ser.write(CMD_SCAN)
-            descriptor = ser.read(7)  # Skip header parsing for brevity
+            get_descriptor(ser)
             temp_array = [0] * len(check_angles)
             current_index = 0
             while lidar_active:
                 packet = ser.read(5)
+                if len(packet) != 5:
+                    continue
                 result = parse_packet(packet)
                 if result is None:
                     continue
@@ -121,6 +130,34 @@ def lidar_task(client_sock):
                     current_index += 1
                     if current_index >= len(check_angles):
                         current_index = 0
+                        # Enkel metod: räkna ut position baserat på avstånd till sargen i kända riktningar
+                        left = temp_array[90]   # vänster
+                        right = temp_array[270] # höger
+                        front = temp_array[0]   # framåt
+                        back = temp_array[180]  # bakåt
+                        if all(d > 0 for d in [left, right, front, back]):
+                            map_width = 400
+                            map_height = 400
+                            lidar_x = (map_width - right + left) / 2.0
+                            lidar_y = (map_height - back + front) / 2.0
+
+                            # Använd accelerometer-data
+                            ax, ay = 0.0, 0.0
+                            if esp_serial.in_waiting:
+                                esp_line = esp_serial.readline().decode().strip()
+                                if esp_line.startswith("mpu:"):
+                                    try:
+                                        parts = esp_line.replace("mpu:", "").split(",")
+                                        ax = float(parts[0].split(":")[1])
+                                        ay = float(parts[1].split(":")[1])
+                                    except:
+                                        pass
+
+                            x_filtered = kalman_update(kalman_x, ax, lidar_x)
+                            y_filtered = kalman_update(kalman_y, ay, lidar_y)
+
+                            update_position(round(x_filtered), round(y_filtered))
+                            client_sock.send(f"POS:{round(x_filtered)},{round(y_filtered)}\r\n".encode("utf-8"))
                         lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
                         client_sock.send((lidar_string + "\n").encode("utf-8"))
     except Exception as e:
@@ -140,24 +177,19 @@ def dwm_position_task(client_sock):
             time.sleep(0.1)
             ser.write(b"\r")
             time.sleep(0.1)
-
             while True:
                 if ser.in_waiting:
                     line = ser.readline().decode("utf-8").strip()
                     if "dwm>" in line:
                         break
-
             ser.write(b"lep\r")
             time.sleep(0.2)
             print("[AGV] DWM-positionering startad.")
-
             last_time = time.time()
-
             while True:
                 now = time.time()
                 dt = now - last_time
                 last_time = now
-
                 ax, ay = 0.0, 0.0
                 if esp_serial.in_waiting:
                     esp_line = esp_serial.readline().decode().strip()
@@ -166,23 +198,18 @@ def dwm_position_task(client_sock):
                             parts = esp_line.replace("mpu:", "").split(",")
                             ax = float(parts[0].split(":")[1])
                             ay = float(parts[1].split(":")[1])
-                        except Exception as e:
-                            print("[Kalman] Fel vid parsing av MPU:", e)
+                        except:
                             continue
-
                 line = ser.readline().decode("utf-8").strip()
                 if line.startswith("POS,"):
                     parts = line.split(",")
                     if len(parts) >= 3:
                         raw_x = float(parts[1]) * 100.0
                         raw_y = float(parts[2]) * 100.0
-
                         x_filtered = kalman_update(kalman_x, ax, raw_x, dt)
                         y_filtered = kalman_update(kalman_y, ay, raw_y, dt)
-
-                        update_position(round(x_filtered), round(y_filtered))
-                        client_sock.send(f"POS:{round(x_filtered)},{round(y_filtered)}\r\n".encode("utf-8"))
-                        print(f"[AGV] Kalman POS: {round(x_filtered)},{round(y_filtered)}")
+                        x, y = round(x_filtered), round(y_filtered)
+                        client_sock.send(f"POS:{x},{y}\r\n".encode("utf-8"))
     except Exception as e:
         print("[AGV] DWM-fel:", e)
 
@@ -194,11 +221,9 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
     except ValueError as e:
         print(f"[AGV] Fel vid konvertering av koordinater: {e}")
         return
-
     current_x, current_y = get_position()
     dx = target_x - current_x
     dy = target_y - current_y
-
     if angle == 0:
         esp_serial.write(b'0')
     elif angle == 45:
@@ -217,25 +242,21 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         esp_serial.write(b'8')
     else:
         esp_serial.write(b'9')
-
-    esp_serial.write(b'0')  
+    esp_serial.write(b'0')
     while abs(dx) > 5 and abs(dy) > 5:
         current_x, current_y = get_position()
         dx = target_x - current_x
         dy = target_y - current_y
-
     if abs(dx) <= 5 and abs(dy) <= 5:
-        print(f"[AGV] Nra mlet: dx={dx}, dy={dy}, skickar kommando 9 (stopp)")
-        esp_serial.write(b'9')
         print(f"[AGV] Mlet ntt: dx={dx}, dy={dy}, skickar kommando 9")
+        esp_serial.write(b'9')
         return
 
-# === Bluetooth-server ===
 server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
 server_sock.bind(("", bluetooth.PORT_ANY))
 server_sock.listen(1)
 port = server_sock.getsockname()[1]
-print(f"[AGV] Bluetooth-server startad på port {port}. Väntar på anslutning...")
+print(f"[AGV] Bluetooth-server startad p\u00e5 port {port}. V\u00e4ntar p\u00e5 anslutning...")
 
 try:
     while True:
@@ -269,7 +290,7 @@ try:
             print(f"[AGV] Anslutning avslutad ({e})")
         finally:
             client_sock.close()
-            print("[AGV] Väntar på ny anslutning...")
+            print("[AGV] V\u00e4ntar p\u00e5 ny anslutning...")
 except KeyboardInterrupt:
     print("[AGV] Avslutar Bluetooth-server...")
     server_sock.close()
